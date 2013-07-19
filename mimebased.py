@@ -1,6 +1,8 @@
 # Parsers for MIME based protocols
 # by Mario Vilas (mvilas at gmail.com)
 
+from urlparse import urlparse, urlsplit, urlunparse, urlunsplit
+
 #------------------------------------------------------------------------------
 
 class Headers:
@@ -18,7 +20,7 @@ class Headers:
         return not line.strip()
 
     def is_multi_line_header(self, line):
-        return not line.strip().endswith(self.value_separator)
+        return line.strip().endswith(self.value_separator)
 
     def __init__(self, data = None):
         if data is None:
@@ -32,11 +34,13 @@ class Headers:
             if self.is_last_header(line):
                 break
             if beginLine:
-                name, value = line.split(self.header_separator)
+                spline = line.split(self.header_separator)
+                name  = spline[0]
+                value = self.header_separator.join(spline[1:])
                 name  = name.strip()
                 value = value.strip()
             else:
-                name = self.__headerList[-1][0]
+                name  = self.__headerList[-1][0]
                 value = line.strip()
             self.append( (name, value) )
             beginLine = not self.is_multi_line_header(line)
@@ -94,11 +98,13 @@ class Headers:
 
     def __delitem__(self, name):
         self.__headerCache = None
-        del self.__headerDict[self.normalize_header(name)]
+        name = self.normalize_header(name)
+        del self.__headerDict[name]
         i = 0
         while i < len(self.__headerList):
-            if self.__headerList[0][0] == name:
-                del self.__headerList[0]
+            this_name = self.normalize_header(self.__headerList[i][0])
+            if this_name == name:
+                del self.__headerList[i]
             else:
                 i += 1
 
@@ -356,17 +362,18 @@ class HTTPRequest(Request):
         if pieces[1] == '':
             if not self.has_key('Host'):
                 raise Exception, "Can't get absolute URL"
-            pieces[1] = self['Host']
+            pieces[1] = self['Host'].split(self.value_separator)[0].strip()
         url = urlunsplit( tuple(pieces) )
         return url
 
     def setURL(self, url):
         pieces = urlsplit(url)
-        if pieces[2] != '':
-            self['Host'] = pieces[2]
-        pieces = ('', '') + pieces[2:]
-        path   = urlunsplit(pieces)
-        self.setPath(path)
+        if pieces[1] != '':
+            self['Host'] = pieces[1]
+##        pieces = ('', '') + pieces[2:]    # relative path
+##        path   = urlunsplit(pieces)
+##        self.setPath(path)
+        self.setPath(url)                 # absolute path
 
 
 class HTTPResponse(Response):
@@ -413,6 +420,13 @@ class HTTPResponse(Response):
         '504': 'Gateway Timeout',
         '505': 'HTTP Version Not Supported'
     }
+
+    errorPage = (
+                        '<html>'
+                        '<head><title>%(status)s %(text)s</title></head>'
+                        '<body><h1>%(status)s</h1><h2>%(text)s</h2></body>'
+                        '</html>'
+                    )
 
 
 HTTPRequest.makeResponse = HTTPResponse

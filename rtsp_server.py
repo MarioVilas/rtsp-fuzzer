@@ -1,23 +1,41 @@
 # Simple RTSP server
 # by Mario Vilas (mvilas at gmail.com)
 
-from mimebased import Message, RTSPRequest, RTSPResponse
+# TO DO list:
+#   [ ] Serialize access to Transport objects
+
+import mimebased
+from mimebased import Message, Factory
+from mimebased import RTSPRequest, RTSPResponse, HTTPRequest, HTTPResponse
 
 from urlparse import urlsplit, urlunsplit
 from thread import start_new_thread
+from threading import Event
 from socket import socket, AF_INET, SOCK_DGRAM, SOCK_STREAM
 from select import select
 
+import traceback
+
 #==============================================================================
 
-class BaseTransport:
-    input_parser    = Message
-    output_parser   = Message
+class RTSPFactory(Factory):
+    'RTSP message factory'
+
+    registeredParsers = (
+        RTSPRequest, RTSPResponse,
+        HTTPRequest, HTTPResponse,
+        )
+
+class Transport:
+    'Virtual base class for Transport objects'
 
     def __init__(self, sock = None):
         self.sock = sock
         if self.sock is None:
             self.create()
+
+    def parse(self, data):
+        return RTSPFactory.parse(data)
 
     def connect(self, address):
         if self.sock is None:
@@ -36,7 +54,8 @@ class BaseTransport:
 
 #------------------------------------------------------------------------------
 
-class DatagramTransport(BaseTransport):
+class DatagramTransport(Transport):
+    'Plain UDP transport'
 
     def create(self):
         self.sock = socket(AF_INET, SOCK_DGRAM)
@@ -47,31 +66,43 @@ class DatagramTransport(BaseTransport):
 
     def accept(self):
         select( [self.sock], [], [] )
-        newTransport                = self.__class__()
-        newTransport.input_parser   = self.input_parser
-        newTransport.output_parser  = self.output_parser
-        newTransport.connect(self.address)
+        if self.sock is None:
+            return
+        newTransport            = self.__class__(self.sock)
+##        newTransport.parserList = self.parserList
         return newTransport
 
     def read(self):
         data    = self.sock.recv(0x10000)
-        message = self.input_parser(data)
+        message = self.parse(data)
         return message
 
     def write(self, message):
-        if isinstance(message, self.output_parser):
-            data    = str(message)
-        else:
-            data    = message
-            message = self.output_parser(data)
+        data   = str(message)
         retval = self.sock.sendto(data, self.address)
-        if message.get('Connection', 'close') == 'close':
-            self.close()
         return retval
 
 #------------------------------------------------------------------------------
 
-class StreamTransport(BaseTransport):
+class StreamTransport(Transport):
+    'Plain TCP transport'
+
+##    def __init__(self, sock = None):
+##        Transport.__init__(self, sock)
+##        self.write_buffer = ''
+##
+##    def feed(self, data):
+##        self.write_buffer += data
+##
+##    def consume(self, timeout = 0.5):
+##        count   = 0
+##        r, w, e = select( [], [self.sock], [], timeout )
+##        if self.sock in w:
+##            data, self.write_buffer = self.write_buffer, ''
+##            count = self.sock.send(data)
+##            data  = data[:count]
+##            self.write_buffer = data + self.write_buffer
+##        return count
 
     def create(self):
         self.sock = socket(AF_INET, SOCK_STREAM)
@@ -81,19 +112,21 @@ class StreamTransport(BaseTransport):
         return self.sock.listen(5)
 
     def accept(self):
+        select( [self.sock], [], [] )
+        if self.sock is None:
+            return
         newSocket, peerAddress      = self.sock.accept()
         newTransport                = self.__class__(newSocket)
         newTransport.address        = peerAddress
-        newTransport.input_parser   = self.input_parser
-        newTransport.output_parser  = self.output_parser
+##        newTransport.parserList     = self.parserList
         return newTransport
 
     def read(self):
-        if self.sock is None:
-            self.connect(self.address)
+##        if self.sock is None:
+##            self.connect(self.address)
         rawData = ''
         maxHeader = 0x1000
-        endHeader = self.input_parser.newline * 2
+        endHeader = Message.newline * 2
         while endHeader not in rawData:
             recvSize = maxHeader - len(rawData)
             if recvSize <= 0:
@@ -102,7 +135,7 @@ class StreamTransport(BaseTransport):
             if len(newData) == 0:
                 raise Exception, 'Connection closed by peer'
             rawData += newData
-        message = self.input_parser(rawData)
+        message = self.parse(rawData)
         contentLength = message.get('Content-length', 0)
         if contentLength > 0:
             recvSize = contentLength - len(message.getData())
@@ -116,151 +149,213 @@ class StreamTransport(BaseTransport):
         return message
 
     def write(self, message):
-        if self.sock is None:
-            self.connect(self.address)
-        if isinstance(message, self.output_parser):
-            data    = str(message)
-        else:
-            data    = message
-            message = self.output_parser(data)
+##        if self.sock is None:
+##            self.connect(self.address)
+        data   = str(message)
         retval = self.sock.sendall(data)
-        if message.get('Connection', 'close') == 'close':
-            self.close()
         return retval
 
 #------------------------------------------------------------------------------
 
-class Client:
+class Server:
+    'Base class for RTSP servers'
 
-    def __init__(self, transportClass, targetAddress = 'localhost',
-                                                             targetPort = 554):
+    def __init__(self, transportClass = StreamTransport,
+                                    bindAddress = 'localhost', bindPort = 554):
         self.transportClass = transportClass
-        self.targetAddress  = targetAddress
-        self.targetPort     = targetPort
+        self.bindAddress    = bindAddress
+        self.bindPort       = bindPort
+        self.alive          = True
+        self.debugging      = True  # False
+        self.killEvent      = Event()
 
-    def connect(self):
-        self.cseq = 0
+    def kill(self, timeout = None):
+        self.alive = False
+        self.listener.close()
+        return self.killEvent.wait(timeout)
+
+    def spawn(self):
+        start_new_thread(self.run, ())
+
+    def run(self):
+        try:
+            self.listener = self.transportClass()
+            self.listener.bind( (self.bindAddress, self.bindPort) )
+            self.listener.listen()
+            while self.alive:
+                newTransport = self.listener.accept()
+                if self.alive:
+                    start_new_thread( self.serve, (newTransport,) )
+##            self.listener.close()
+        except:
+            if self.debugging:
+                traceback.print_exc()
+                print
+        self.killEvent.set()
+
+    def serve(self, transport):
+        try:
+            while transport.sock is not None:
+                req  = transport.read()
+                name = 'do_%s' % req.getMethod()
+                fn   = getattr(self, name, self.serveUnknown)
+                resp = fn(req, transport)
+                if not resp:
+                    resp = self.buildErrorResponse(req, '500')
+                transport.write(resp)
+        except:
+            if self.debugging:
+                traceback.print_exc()
+                print
+
+    def serveUnknown(self, req, transport):
+        return self.buildErrorResponse(req, '405')
+
+    def buildRequest(self, method, path, data, cseq = 0):
+        req = RTSPRequest()
+        req.setMethod( method )
+        req.setPath( path )
+        req.setProtocol( req.supportedProtocols[0] )
+        req.setData( data )
+        req['Content-length']   = len( req.getData() )
+        req['CSeq']             = cseq
+        return req
+
+    def buildResponse(self, req, status = '200', data = ''):
+##        resp = RTSPResponse()
+        resp = req.makeResponse()
+        resp.setStatus( status )
+        resp.setProtocol( req.getProtocol() )
+        resp.setText( resp.supportedCodes[ resp.getStatus() ] )
+        resp.setData( data )
+        resp['Content-length']      = len( resp.getData() )
+        resp['CSeq']                = req.get('CSeq', 0)
+        if req.has_key('Connection'):
+            resp['Connection']      = req['Connection']
+        return resp
+
+    def buildErrorResponse(self, req, status):
+        if hasattr(req.makeResponse, 'errorPage'):          # XXX ugly hack
+            text = req.makeResponse.supportedCodes[status]
+            data = req.makeResponse.errorPage % vars()
+            return self.buildResponse(req, status, data)
+        return self.buildResponse(req, status)
+
+#------------------------------------------------------------------------------
+
+class Client(Server):
+    'Base class for RTSP clients'
+
+    def connect(self, targetAddress, targetPort = 554):
         self.connection = self.transportClass()
-        self.connection.input_parser  = RTSPRequest
-        self.connection.output_parser = RTSPResponse
-        self.connection.connect( (self.targetAddress, self.targetPort) )
+        self.connection.connect( (targetAddress, targetPort) )
 
-    def close(self):
+    def disconnect(self):
         c = self.connection
         del self.connection
         c.close()
 
 #------------------------------------------------------------------------------
 
-class Server:
-
-    def __init__(self, transportClass, bindAddress = 'localhost',
-                                                               bindPort = 554):
-        self.transportClass = transportClass
-        self.bindAddress    = bindAddress
-        self.bindPort       = bindPort
-        self.alive          = True
-
-    def run(self):
-        self.listener = self.transportClass()
-        self.listener.input_parser  = RTSPRequest
-        self.listener.output_parser = RTSPResponse
-        self.listener.bind( (self.bindAddress, self.bindPort) )
-        self.listener.listen()
-        while self.alive:
-            newTransport                = self.listener.accept()
-            newTransport.input_parser   = RTSPRequest
-            newTransport.output_parser  = RTSPResponse
-            start_new_thread(self.serve, ())
-        self.listener.close()
-
-    def serve(self, transport):
-        while transport.sock is not None:
-            req  = transport.read()
-            fn   = getattr(self, 'do_%s' % req.getMethod(), self.serveUnknown)
-            resp = fn(req, transport)
-            if not resp:
-                resp = self.buildResponse(req, '500')
-            transport.write(resp)
-
-    def serveUnknown(self, req):
-        return self.buildResponse(req, '405')
-
-    def buildResponse(self, req, status = '200', data = ''):
-        resp = RTSPResponse()
-        resp.setStatus( status )
-        resp.setProtocol( req.getProtocol() )
-        resp.setText( req.supportedCodes[ resp.getStatus() ] )
-        resp.setData( data )
-        resp['Content-length']  = len( resp.getData() )
-        resp['Connection']      = req.get('Connection', 'persistent')
-        resp['CSeq']            = req.get('CSeq', 0)
-        return resp
-
-#------------------------------------------------------------------------------
-
 class Proxy(Server):
+    'Base class for RTSP proxies'
 
-    def __init__(self, transportClass, connectAddress, connectPort = 554,
+    def __init__(self, transportClass = StreamTransport,
                                     bindAddress = 'localhost', bindPort = 554):
         Server.__init__(self, transportClass, bindAddress, bindPort)
-        self.connectAddress = connectAddress
-        self.connectPort    = connectPort
+        self.connectionDict = {}
+
+    def proxy_connect(self, req):
+##        url = req.getURL()
+        url = req.getPath()
+        host = urlsplit(url)[1]
+        if ':' in host:
+            connectAddress, connectPort = host.split(':')
+        else:
+            connectAddress, connectPort = host, '554'
+        connectPort = int(connectPort)
+        self.changeURL(req, connectAddress, connectPort)
+        key = (connectAddress, connectPort)
+        if self.connectionDict.has_key(key):
+            connection = self.connectionDict[key]
+        else:
+            connection = self.transportClass()
+            connection.connect( (connectAddress, connectPort) )
+            self.connectionDict[key] = connection
+        return connection
 
     def proxy(self, req):
-        transport               = self.transportClass()
-        transport.input_parser  = RTSPRequest
-        transport.output_parser = RTSPResponse
-        transport.connect( (self.connectAddress, self.connectPort) )
-        transport.write(req)
-        resp = transport.read()
+        try:
+            connection = self.proxy_connect(req)
+            connection.write(req)
+            resp = connection.read()
+        except:
+            if self.debugging:
+                traceback.print_exc()
+                print
+            resp = self.buildErrorResponse(req, '502')
         return resp
 
-    def serve(self):
-        while transport.sock is not None:
-            req  = transport.read()
-            pre  = getattr(self, 'pre_%s' % req.getMethod(),  self.preUnknown)
-            post = getattr(self, 'post_%s' % req.getMethod(), self.postUnknown)
-            req  = pre(req)
-            if req:
-                resp = self.proxy(req)
-                if resp:
-                    resp = post(resp)
+    def serve(self, transport):
+        try:
+            while transport.sock is not None:
+                req  = transport.read()
+                pre  = getattr(self, 'pre_%s' % req.getMethod(),  self.preUnknown)
+                post = getattr(self, 'post_%s' % req.getMethod(), self.postUnknown)
+                req  = pre(req, transport)
+                if req:
+                    resp = self.proxy(req)
                     if resp:
-                        transport.write(resp)
-                    else:
-                        transport.close()
+                        resp = post(resp, transport)
+                        if resp:
+                            transport.write(resp)
+                        else:
+                            transport.close()
+        except:
+            if self.debugging:
+                traceback.print_exc()
+                print
 
-    def changeURL(self, req):
+    def changeURL(self, req, connectAddress, connectPort):
         url         = req.getURL()
         pieces      = list( urlsplit(url) )
-        pieces[1]   = '%s:%d' % (self.connectAddress, self.connectPort)
+        pieces[1]   = '%s:%d' % (connectAddress, connectPort)
         url         = urlunsplit( tuple(pieces) )
         req.setURL(url)
         return req
 
-    def preUnknown(self, req):
-        req = self.changeURL(req)
-        print '-' * 79
-        print str(req)
-        print '-' * 79
+    def preUnknown(self, req, transport):
+        if self.debugging:
+            print '-' * 79
+            print str(req)
+            print '-' * 79
         return req
 
-    def postUnknown(self, resp):
-        print '-' * 79
-        print str(resp)
-        print '-' * 79
+    def postUnknown(self, resp, transport):
+        if self.debugging:
+            print '-' * 79
+            print str(resp)
+            print '-' * 79
         return resp
 
 #==============================================================================
 
 def testme():
-    proxy_tcp = Proxy(StreamTransport,   'localhost', 554, 'localhost', 555)
-    proxy_udp = Proxy(DatagramTransport, 'localhost', 554, 'localhost', 555)
-    start_new_thread(proxy_tcp.run, ())
-    start_new_thread(proxy_udp.run, ())
-    print 'Hit Enter to close'
+    'Some rudimentary test code'
+    print 'Running.'
+    proxy_tcp = Proxy(StreamTransport,   'localhost', 5454)
+    proxy_udp = Proxy(DatagramTransport, 'localhost', 5455)
+    print 'Starting UDP proxy...'
+    proxy_udp.spawn()
+    print 'Starting TCP proxy...'
+    proxy_tcp.spawn()
+    print 'Hit Enter to close.'
     raw_input()
+    print 'Shutting down UDP proxy...'
+    proxy_udp.kill()
+    print 'Shutting down TCP proxy...'
+    proxy_tcp.kill()
+    print 'Done.'
 
 if __name__ == '__main__':
     testme()
