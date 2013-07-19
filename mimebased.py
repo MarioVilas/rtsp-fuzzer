@@ -157,9 +157,16 @@ class Message(Headers):
     def getLine(self):          return self.__line
     def setLine(self, line):    self.__line = line
 
+    def getHeaders(self):       return Headers.__str__(self)
+    def setHeaders(self, data): Headers.__init__(self, data)
+
     def getData(self):          return self.__data
     def setData(self, data):    self.__data  = data
     def appendData(self, data): self.__data += data
+
+    @classmethod
+    def identify(self, data):
+        return (self.newline * 2) in data
 
     def validate(self):
         extended = self.normalize_header('X-')
@@ -178,9 +185,19 @@ class Request(Message):
     def isRequest(self):    return True
     def isResponse(self):   return False
 
+    def getLine(self):
+        return '%s %s %s' % (
+                                self.getMethod(),
+                                self.getPath(),
+                                self.getProtocol()
+                            )
+
     def setLine(self, line):
         Message.setLine(self, line)
-        method, path, protocol = line.split(' ')
+        spline      = line.split(' ')
+        method      = spline[0]
+        path        = spline[1]
+        protocol    = ' '.join(spline[2:])
         self.setMethod(method)
         self.setPath(path)
         self.setProtocol(protocol)
@@ -192,9 +209,6 @@ class Request(Message):
     def setMethod(self, method):        self.__method   = method
     def setPath(self, path):            self.__path     = path
     def setProtocol(self, protocol):    self.__protocol = protocol
-
-    getURL = getPath
-    setURL = setPath
 
     @classmethod
     def identify(self, data):
@@ -227,7 +241,10 @@ class Response(Message):
 
     def setLine(self, line):
         if line:
-            protocol, status, text = line.split(' ')
+            spline      = line.split(' ')
+            protocol    = spline[0]
+            status      = spline[1]
+            text        = ' '.join(spline[2:])
         else:
             protocol, status, text = '', '', ''
         self.setProtocol(protocol)
@@ -288,23 +305,8 @@ class SendMail(Message):
 
 #------------------------------------------------------------------------------
 
-class HTTPRequest(Request):
+class HTTP:
     supportedProtocols  = ( 'HTTP/1.1', 'HTTP/1.0' )
-
-    supportedMethods    = (
-        'OPTIONS',
-        'GET',
-        'HEAD',
-        'POST',
-        'PUT',
-        'DELETE',
-        'TRACE',
-        'CONNECT',
-        'LOCK',
-        'MKCOL',
-        'COPY',
-        'MOVE',
-    )
 
     supportedHeaders    = (
         'Accept',
@@ -354,6 +356,8 @@ class HTTPRequest(Request):
         'Warning',
     )
 
+    defaultPort = 80
+
     def getURL(self):
         path   = self.getPath()
         pieces = list( urlsplit(path) )
@@ -370,16 +374,42 @@ class HTTPRequest(Request):
         pieces = urlsplit(url)
         if pieces[1] != '':
             self['Host'] = pieces[1]
-##        pieces = ('', '') + pieces[2:]    # relative path
-##        path   = urlunsplit(pieces)
-##        self.setPath(path)
-        self.setPath(url)                 # absolute path
+            if not '://' in self.getPath():
+                pieces = ('', '') + pieces[2:]  # relative path
+                url    = urlunsplit(pieces)
+        self.setPath(url)                       # absolute path
 
+    def getBaseURL(self):
+        url = self.getURL()
+        pieces = urlsplit(url)
+        pieces = pieces[:2] + ( ('',) * (len(pieces) - 2) )
+        path   = urlunsplit(pieces)
+        return path
 
-class HTTPResponse(Response):
-    supportedProtocols  = HTTPRequest.supportedProtocols
-    supportedHeaders    = HTTPRequest.supportedHeaders
+    def getRelativeURL(self):
+        url = self.getURL()
+        pieces = urlsplit(url)
+        pieces = ('', '') + pieces[2:]
+        path   = urlunsplit(pieces)
+        return path
 
+class HTTPRequest(HTTP, Request):
+    supportedMethods    = (
+        'OPTIONS',
+        'GET',
+        'HEAD',
+        'POST',
+        'PUT',
+        'DELETE',
+        'TRACE',
+        'CONNECT',
+        'LOCK',
+        'MKCOL',
+        'COPY',
+        'MOVE',
+    )
+
+class HTTPResponse(HTTP, Response):
     supportedCodes      = {
         '100': 'Continue',
         '101': 'Switching Protocols',
@@ -428,28 +458,13 @@ class HTTPResponse(Response):
                         '</html>'
                     )
 
-
-HTTPRequest.makeResponse = HTTPResponse
-HTTPResponse.makeRequest = HTTPRequest
+HTTP.makeRequest  = HTTPRequest
+HTTP.makeResponse = HTTPResponse
 
 #------------------------------------------------------------------------------
 
-class RTSPRequest(Request):
+class RTSP:
     supportedProtocols  = ( 'RTSP/1.0' )
-
-    supportedMethods    = (
-        'OPTIONS',
-        'DESCRIBE',
-        'ANNOUNCE',
-        'SETUP',
-        'PLAY',
-        'PAUSE',
-        'TEARDOWN',
-        'GET_PARAMETER',
-        'SET_PARAMETER',
-        'REDIRECT',
-        'RECORD',
-    )
 
     supportedHeaders    = (
         'Accept',
@@ -498,11 +513,31 @@ class RTSPRequest(Request):
         'WWW-Authenticate',
     )
 
+    defaultPort = 554
 
-class RTSPResponse(Response):
-    supportedProtocols  = RTSPRequest.supportedProtocols
-    supportedHeaders    = RTSPRequest.supportedHeaders
+    def getURL(self):
+        return self.getPath()
 
+    def setURL(self, url):
+        self.setPath(url)
+
+class RTSPRequest(RTSP, Request):
+
+    supportedMethods    = (
+        'OPTIONS',
+        'DESCRIBE',
+        'ANNOUNCE',
+        'SETUP',
+        'PLAY',
+        'PAUSE',
+        'TEARDOWN',
+        'GET_PARAMETER',
+        'SET_PARAMETER',
+        'REDIRECT',
+        'RECORD',
+    )
+
+class RTSPResponse(RTSP, Response):
     supportedCodes        = HTTPResponse.supportedCodes
     supportedCodes['250'] = 'Low on Storage Space'
     supportedCodes['405'] = 'Method Not Allowed'
@@ -521,9 +556,8 @@ class RTSPResponse(Response):
     supportedCodes['505'] = 'RTSP Version Not Supported'
     supportedCodes['551'] = 'Option not supported'
 
-
-RTSPRequest.makeResponse = RTSPResponse
-RTSPResponse.makeRequest = RTSPRequest
+RTSP.makeRequest  = RTSPRequest
+RTSP.makeResponse = RTSPResponse
 
 #------------------------------------------------------------------------------
 
@@ -589,22 +623,51 @@ class SDPSession(Headers):
 #------------------------------------------------------------------------------
 
 class Factory:
+    'Base class for Message object factories.'
+
     registeredParsers = tuple()
 
     @classmethod
     def getParser(self, data):
+        'Try to find a suitable parser for the given data.'
         for parserClass in self.registeredParsers:
             if parserClass.identify(data):
                 return parserClass
 
     @classmethod
     def parse(self, data):
+        'Try to parse the data and return a single Message object.'
         parserClass = self.getParser(data)
         if parserClass is None:
             raise Exception, 'No suitable parser was found'
         return parserClass(data)
 
+    @classmethod
+    def recursive(self, data):
+        (
+        "Try to parse the data recursively and return a list of Message"
+        " objects, ending with a string with the data that couldn't be parsed."
+        )
+        messageList = []
+        while data:
+            parserClass = self.getParser(data)
+            if parserClass is None:
+                messageList.append(data)
+                data = ''
+            else:
+                message = parserClass(data)
+                messageList.append(message)
+                data = message.getData()
+        return messageList
+
+class GenericFactory(Factory):
+    'Example factory that can only parse generic Message objects.'
+    registeredParsers = (
+        Message,
+    )
+
 class ParserFactory(Factory):
+    'Example factory that can parse any protocol supported by this library.'
     registeredParsers = (
         HTTPRequest,
         HTTPResponse,
@@ -615,16 +678,14 @@ class ParserFactory(Factory):
         ReadMail,
     )
 
-class RequestFactory(Factory):
+class StreamingFactory(Factory):
+    'Example HTTP, RTSP and SDP factory.'
     registeredParsers = (
         HTTPRequest,
-        RTSPRequest,
-    )
-
-class ResponseFactory(Factory):
-    registeredParsers = (
         HTTPResponse,
+        RTSPRequest,
         RTSPResponse,
+        SDPSession,
     )
 
 #------------------------------------------------------------------------------

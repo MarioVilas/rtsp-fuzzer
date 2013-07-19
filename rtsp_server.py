@@ -2,10 +2,14 @@
 # by Mario Vilas (mvilas at gmail.com)
 
 # TO DO list:
+#   [ ] Encapsulate RTSP into HTTP
+#   [ ] Handle more than one message in a single UDP packet
+#   [ ] Parse SDP announcements
+#   [ ] Implement RDP
 #   [ ] Serialize access to Transport objects
 
 import mimebased
-from mimebased import Message, Factory
+from mimebased import Message, StreamingFactory
 from mimebased import RTSPRequest, RTSPResponse, HTTPRequest, HTTPResponse
 
 from urlparse import urlsplit, urlunsplit
@@ -13,18 +17,11 @@ from thread import start_new_thread
 from threading import Event
 from socket import socket, AF_INET, SOCK_DGRAM, SOCK_STREAM
 from select import select
+from time import asctime
 
 import traceback
 
 #==============================================================================
-
-class RTSPFactory(Factory):
-    'RTSP message factory'
-
-    registeredParsers = (
-        RTSPRequest, RTSPResponse,
-        HTTPRequest, HTTPResponse,
-        )
 
 class Transport:
     'Virtual base class for Transport objects'
@@ -35,9 +32,13 @@ class Transport:
             self.create()
 
     def parse(self, data):
-        return RTSPFactory.parse(data)
+        return StreamingFactory.parse(data)
+
+    def recursive(self, data):
+        return StreamingFactory.recursive(data)
 
     def connect(self, address):
+        print 'CONNECTING TO %s:%d' % address           # XXX
         if self.sock is None:
             self.create()
         self.address = address
@@ -122,6 +123,7 @@ class StreamTransport(Transport):
         return newTransport
 
     def read(self):
+        print 'READING'                                         # XXX
 ##        if self.sock is None:
 ##            self.connect(self.address)
         rawData = ''
@@ -136,29 +138,36 @@ class StreamTransport(Transport):
                 raise Exception, 'Connection closed by peer'
             rawData += newData
         message = self.parse(rawData)
-        contentLength = message.get('Content-length', 0)
+        contentLength = message.get('Content-length', '0')
+        contentLength = long(contentLength)
+        print 'CONTENT LENGTH %d' % contentLength               # XXX
         if contentLength > 0:
-            recvSize = contentLength - len(message.getData())
-            while recvSize > 0:
+            recvSize = len(message.getData())
+            missingSize = contentLength - recvSize
+            print 'MISSING DATA %d' % missingSize               # XXX
+            while missingSize > 0:
                 newData = self.sock.recv(0x1000)
                 message.appendData(newData)
                 if not newData:
                     break
-            if recvSize > 0:
-                raise Exception, 'Connection closed by peer'
+##            if missingSize > 0:
+##                raise Exception, 'Connection closed by peer'
         return message
 
     def write(self, message):
 ##        if self.sock is None:
 ##            self.connect(self.address)
         data   = str(message)
+        print 'WRITING %r' % data                               # XXX
         retval = self.sock.sendall(data)
         return retval
 
 #------------------------------------------------------------------------------
 
 class Server:
-    'Base class for RTSP servers'
+    'Base class for streaming servers'
+
+    userAgent = 'BaseStreamingServer'
 
     def __init__(self, transportClass = StreamTransport,
                                     bindAddress = 'localhost', bindPort = 554):
@@ -211,14 +220,20 @@ class Server:
     def serveUnknown(self, req, transport):
         return self.buildErrorResponse(req, '405')
 
-    def buildRequest(self, method, path, data, cseq = 0):
+    def buildRequest(self, method, path, data, cseq = 0, session = None):
         req = RTSPRequest()
         req.setMethod( method )
         req.setPath( path )
         req.setProtocol( req.supportedProtocols[0] )
         req.setData( data )
-        req['Content-length']   = len( req.getData() )
-        req['CSeq']             = cseq
+        req['User-Agent']       = self.userAgent
+        if cseq is not None:
+            req['CSeq']         = cseq
+        contentLength           = len( req.getData() )
+        if contentLength > 0:
+            req['Content-length'] = contentLength
+        if session is not None:
+            req['Session']      = session
         return req
 
     def buildResponse(self, req, status = '200', data = ''):
@@ -228,10 +243,15 @@ class Server:
         resp.setProtocol( req.getProtocol() )
         resp.setText( resp.supportedCodes[ resp.getStatus() ] )
         resp.setData( data )
+        if req.has_key('Cseq'):
+            resp['CSeq']            = req['CSeq']
+        resp['Cache-Control']       = 'no-cache'
         resp['Content-length']      = len( resp.getData() )
-        resp['CSeq']                = req.get('CSeq', 0)
+        resp['Date']                = asctime()
+        resp['Expires']             = resp['Date']
         if req.has_key('Connection'):
             resp['Connection']      = req['Connection']
+        resp['Server']              = self.userAgent
         return resp
 
     def buildErrorResponse(self, req, status):
@@ -244,7 +264,9 @@ class Server:
 #------------------------------------------------------------------------------
 
 class Client(Server):
-    'Base class for RTSP clients'
+    'Base class for streaming clients'
+
+    userAgent = 'BaseStreamingClient'
 
     def connect(self, targetAddress, targetPort = 554):
         self.connection = self.transportClass()
@@ -258,7 +280,9 @@ class Client(Server):
 #------------------------------------------------------------------------------
 
 class Proxy(Server):
-    'Base class for RTSP proxies'
+    'Base class for streaming proxies'
+
+    userAgent = 'BaseStreamingProxy'
 
     def __init__(self, transportClass = StreamTransport,
                                     bindAddress = 'localhost', bindPort = 554):
@@ -272,13 +296,15 @@ class Proxy(Server):
         if ':' in host:
             connectAddress, connectPort = host.split(':')
         else:
-            connectAddress, connectPort = host, '554'
+            connectAddress, connectPort = host, req.defaultPort
         connectPort = int(connectPort)
         self.changeURL(req, connectAddress, connectPort)
         key = (connectAddress, connectPort)
         if self.connectionDict.has_key(key):
             connection = self.connectionDict[key]
-        else:
+            if connection.sock is None:
+                del self.connectionDict[key]
+        if not self.connectionDict.has_key(key):
             connection = self.transportClass()
             connection.connect( (connectAddress, connectPort) )
             self.connectionDict[key] = connection
@@ -287,6 +313,9 @@ class Proxy(Server):
     def proxy(self, req):
         try:
             connection = self.proxy_connect(req)
+            req.append( ('Via', self.userAgent) )
+            if hasattr(req, 'getRelativeURL'):
+                req.setPath( req.getRelativeURL() )
             connection.write(req)
             resp = connection.read()
         except:
